@@ -67,14 +67,14 @@ class IconMatch:
 @dataclass
 class IconsConfig:
     default: t.Union[str, Path]
-    mapping: Sequence[IconMatch]
+    mapping: t.Sequence[IconMatch]
 
 
 @dataclass
 class Config:
     fallback_mode: Mode
     icons: IconsConfig
-    preferred_devices: Sequence[int] = ()
+    preferred_devices: t.Sequence[int] = ()
 
 
 def get_unlocked_yk_session(connection, yk_settings):
