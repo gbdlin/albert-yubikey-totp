@@ -2,8 +2,9 @@
 """
 Fetch specific HOTP/TOTP token from Yubikey OATH module
 """
-import re
 import os
+import re
+import typing as t
 
 os.environ['YKMAN_XDG_EXPERIMENTAL'] = "1"
 
@@ -13,22 +14,15 @@ from enum import Enum
 from functools import reduce
 from operator import or_
 from pathlib import Path
-from typing import Sequence, Tuple, Union
 from threading import Lock
 
 import toml
 from pyperclip import copy
-from ykman.device import list_all_devices, SmartCardConnection
-from yubikit.oath import OathSession
-#from ykman.util import TRANSPORT
+from ykman.device import connect_to_device, list_all_devices, SmartCardConnection
+from yubikit.oath import Code, Credential, OathSession
 from ykman.settings import AppData as YkSettings
 
-
-
-try:
-    from albert import *
-except ImportError:
-    from albert_mock import *
+from albert import *
 
 __title__ = "Yubikey OTP"
 __version__ = "0.4.0"
@@ -72,7 +66,7 @@ class IconMatch:
 
 @dataclass
 class IconsConfig:
-    default: Union[str, Path]
+    default: t.Union[str, Path]
     mapping: Sequence[IconMatch]
 
 
@@ -83,13 +77,31 @@ class Config:
     preferred_devices: Sequence[int] = ()
 
 
-def clip_action_factory(entry, code, session):
+def get_unlocked_yk_session(connection, yk_settings):
+    session = OathSession(connection)
+
+    if session.locked:
+        # TODO: maybe some logic when preferred device is password locked and password is not
+        #  saved with ykman?
+        keys = yk_settings.setdefault('keys', {})
+        if session.device_id in keys:
+            try:
+                session.validate(bytes.fromhex(keys[session.device_id]))
+            except Exception:
+                return None
+        else:
+            return None
+    return session
+
+
+def clip_action_factory(entry: Credential, code: t.Optional[Code], device_serial: int):
     def clip_action_notouch():
         copy(code.value)
 
-
     def clip_action_touch():
-        code = session.calculate(entry)
+        with connect_to_device(device_serial, [SmartCardConnection])[0] as conn:
+            session = get_unlocked_yk_session(conn, yk_settings=YkSettings('oath'))
+            code = session.calculate_code(entry)
         copy(code.value)
 
     if code:
@@ -169,23 +181,7 @@ def get_all_credentials(config):
         if i > 0 and mode == Mode.FIRST:
             break
         with device.open_connection(SmartCardConnection) as conn:
-            session = OathSession(conn)
-
-            print(session.locked)
-            if session.locked:
-                # TODO: maybe some logic when preferred device is password locked and password is not
-                #  saved with ykman?
-                keys = yk_settings.setdefault('keys', {})
-                if session.device_id in keys:
-                    try:
-                        session.validate(bytes.fromhex(keys[session.device_id]))
-                    except Exception:
-                        print('fail')
-                        continue
-                else:
-                    print('not found')
-                    continue
-            print('unlocked')
+            session = get_unlocked_yk_session(conn, yk_settings=yk_settings)
 
             creds += [
                 (
@@ -198,12 +194,12 @@ def get_all_credentials(config):
         ...  # TODO: implement merging logic
     if mode == Mode.MERGE_ALL:
         ...  # TODO: implement merging logic
-    
-    cache_for = min((
-        code.valid_to for _, code, _ in creds
-        if code is not None        
 
-    ))
+    cache_for = min([
+        code.valid_to for _, code, _ in creds
+        if code is not None
+    ] + [float('inf')])
+    cache_for = 30 if cache_for == float('inf') else cache_for
     creds_cache['expiration'] = cache_for
     creds_cache['data'] = creds
 
