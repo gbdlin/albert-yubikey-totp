@@ -5,7 +5,10 @@ Fetches specific HOTP/TOTP token from Yubikey OATH module
 import os
 import re
 import typing as t
-import toml
+try:
+    import tomllib
+except ImportError:
+    import toml as tomllib
 
 os.environ['YKMAN_XDG_EXPERIMENTAL'] = "1"
 
@@ -17,7 +20,7 @@ from operator import or_
 from pathlib import Path
 from threading import Lock
 
-from ykman.device import connect_to_device, list_all_devices, SmartCardConnection
+from ykman.device import list_all_devices, SmartCardConnection
 from yubikit.oath import Code, Credential, OathSession
 from ykman.settings import AppData as YkSettings
 
@@ -124,10 +127,13 @@ class Plugin(PluginInstance, TriggerQueryHandler):
             clipboard_method(code.value)
 
         def clip_action_touch():
-            with connect_to_device(device_serial, [SmartCardConnection])[0] as conn:
-                session = self.get_unlocked_yk_session(conn, yk_settings=YkSettings('oath'))
-                code = session.calculate_code(entry)
-            clipboard_method(code.value)
+            devs = list_all_devices()
+            for dev, nfo in devs:
+                if nfo.serial == device_serial:
+                    with dev.open_connection(SmartCardConnection) as conn:
+                        session = self.get_unlocked_yk_session(conn, yk_settings=YkSettings('oath'))
+                        code = session.calculate_code(entry)
+                    clipboard_method(code.value)
 
         if code:
             return clip_action_notouch
@@ -137,7 +143,7 @@ class Plugin(PluginInstance, TriggerQueryHandler):
     def prepare_config(self):
         if self.config_path.exists():
             with self.config_path.open() as fd:
-                config = toml.load(fd)
+                config = tomllib.load(fd)
         else:
             config = {}
 
@@ -242,6 +248,7 @@ class Plugin(PluginInstance, TriggerQueryHandler):
         stripped = query.string.strip()
         if stripped:
             for entry, code, device_serial in self.get_credentials(stripped):
+                print(device_serial)
                 query.add(
                     StandardItem(
                         id=f'otp-{entry.id.decode()}',
