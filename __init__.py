@@ -107,10 +107,10 @@ class Plugin(PluginInstance, TriggerQueryHandler):
         if session.locked:
             # TODO: maybe some logic when preferred device is password locked and password is not
             #  saved with ykman?
-            keys = yk_settings.setdefault('keys', {})
+            keys = yk_settings
             if session.device_id in keys:
                 try:
-                    session.validate(bytes.fromhex(keys[session.device_id]))
+                    session.validate(bytes.fromhex(keys.get_secret(session.device_id)))
                 except Exception:
                     return None
             else:
@@ -191,14 +191,14 @@ class Plugin(PluginInstance, TriggerQueryHandler):
 
         devices = list_all_devices()
         devices = self.order_devices(devices, self.config.preferred_devices)
-
+        
         if set(self.config.preferred_devices) & {dev_info.serial for _, dev_info in devices}:
             mode = Mode.FIRST
         else:
             mode = self.config.fallback_mode
 
         creds = []
-        yk_settings = YkSettings('oath')
+        yk_settings = YkSettings('oath_keys')
 
         for i, (device, dev_info) in enumerate(devices):
             if i > 0 and mode == Mode.FIRST:
@@ -248,7 +248,6 @@ class Plugin(PluginInstance, TriggerQueryHandler):
         stripped = query.string.strip()
         if stripped:
             for entry, code, device_serial in self.get_credentials(stripped):
-                print(device_serial)
                 query.add(
                     StandardItem(
                         id=f'otp-{entry.id.decode()}',
