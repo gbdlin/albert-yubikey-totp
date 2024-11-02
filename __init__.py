@@ -1,30 +1,31 @@
-# -*- coding: utf-8 -*-
 """
 Fetches specific HOTP/TOTP token from Yubikey OATH module
 """
-import os
-import re
+import json
 import typing as t
-try:
-    import tomllib
-except ImportError:
-    import toml as tomllib
-
-os.environ['YKMAN_XDG_EXPERIMENTAL'] = "1"
-
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from functools import reduce
-from operator import or_
+from hashlib import sha256
+from os.path import splitext
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 
 from ykman.device import list_all_devices, SmartCardConnection
 from yubikit.oath import Code, Credential, OathSession
 from ykman.settings import AppData as YkSettings
 
 from albert import *
+
+try:
+    from albert import TriggerQuery as Query
+except ImportError:
+    pass
+
+try:
+    import tomllib
+except ImportError:
+    import toml as tomllib
 
 md_iid = "2.0"
 md_version = "0.4"
@@ -37,53 +38,111 @@ md_lib_dependencies = ["yubikey-manager", "toml"]
 
 __triggers__ = "otp "
 
-RE_FLAGS = {
-    "a": re.ASCII,
-    "i": re.IGNORECASE,
-    "L": re.LOCALE,
-    "m": re.MULTILINE,
-    "s": re.DOTALL,
-    "u": re.UNICODE,
-    "x": re.VERBOSE,
-}
+ICON_LOCATIONS = [
+    Path.home() / ".local/share/com.yubico.authenticator/issuer_icons/",
+    Path.home() / ".var/app/com.yubico.yubioath/data/authenticator/issuer_icons/",
+    # Path.home() / "Library/Containers/com.yubico.yubioath/Data/Library/Application Support/com.yubico.yubioath/issuer_icons/",
+]
 
 
-class Mode(Enum):
-    FIRST = 'first'            # use only first detected Yubikey
-    ALL = 'all'                # use all entries from all yubikeys
-    MERGE_OPEN = 'merge_open'  # use all entries, but try to display identical only once (skip ones requiring touch)
-    MERGE_ALL = 'merge_all'    # use all entries, but try to display identical only once (include ones requiring touch)
+class IconFinderProtocol(t.Protocol):
+    def get_icon(self, issuer: str, name: str) -> Path | None:
+        ...
 
 
-def re_flags(flags_str: str):
-    return reduce(or_, (
-        RE_FLAGS[flag]
-        for flag in flags_str
-    ))
+class IconFinder(IconFinderProtocol):
+    def __init__(self, config_json: str, location):
+        self.icons = self.load_icons(config_json)
+        self.location = location
+
+    @staticmethod
+    def load_icons(config_json: str):
+        return [
+            {
+                **icon,
+                "issuer": [issuer.upper() for issuer in icon["issuer"]],
+            } for icon in json.loads(config_json)["icons"]
+        ]
+
+    def get_icon(self, issuer: str, name: str) -> Path | None:
+        issuer_upper = issuer.upper()
+        name_upper = name.upper()
+
+        def match_icon(el):
+            return issuer_upper in el["issuer"]
+
+        icon_configs = list(filter(match_icon, self.icons))
+
+        if not len(icon_configs):
+            return None
+
+        filename = icon_configs[0]["filename"]
+        return self.location / (sha256(filename.encode()).hexdigest()[:32] + splitext(filename)[1])
 
 
-@dataclass
-class IconMatch:
-    name: str
-    match: re.Pattern
-    icon: Path
+class NullIconFinder(IconFinderProtocol):
+    def get_icon(self, issuer: str, name: str) -> None:
+        return None
 
 
-@dataclass
-class IconsConfig:
-    default: t.Union[str, Path]
-    mapping: t.Sequence[IconMatch]
+def icon_finder() -> IconFinderProtocol:
+    for location in ICON_LOCATIONS:
+        if not location.exists():
+            continue
+        config_file = location / "50fe9d7f9b390282339fb6264d30773b.json"
+        if not config_file.exists():
+            continue
+
+        try:
+            with config_file.open() as fd:
+                return IconFinder(fd.read(), location)
+        except Exception:
+            continue
+    return NullIconFinder()
+
+
+class Mode(str, Enum):
+    FIRST = "first", "use only first detected Yubikey"
+    ALL = "all", "use all entries from all yubikeys"
+    MERGE_OPEN = (
+        "merge by name and code",
+        "use all entries, but try to merge identical ones by name and generated code (don't merge requiring touch)",
+    )
+    MERGE_ALL = "merge by code", "use all entries, but try to merge identical ones by name (also merge requiring touch)"
+
+    def __new__(cls, value, description):
+        obj = str.__new__(cls, [value])
+        obj._value_ = value
+        obj.description = description
+        return obj
 
 
 @dataclass
 class Config:
     fallback_mode: Mode
-    icons: IconsConfig
     preferred_devices: t.Sequence[int] = ()
 
 
 class Plugin(PluginInstance, TriggerQueryHandler):
     config: Config
+
+    @property
+    def multi_device_mode(self) -> str:
+        return self.config.fallback_mode.value
+
+    @multi_device_mode.setter
+    def multi_device_mode(self, value: str):
+        self.config.fallback_mode = self.prepare_multi_device_mode(value)
+        self.writeConfig('multi_device_mode', value)
+
+    @property
+    def preferred_devices(self) -> str:
+        return ",".join(self.config.preferred_devices)
+
+    @preferred_devices.setter
+    def preferred_devices(self, value: str):
+        self.config.preferred_devices = self.prepare_preferred_devices(value)
+        self.writeConfig('preferred_devices', value)
 
     def __init__(self):
         TriggerQueryHandler.__init__(self,
@@ -97,9 +156,29 @@ class Plugin(PluginInstance, TriggerQueryHandler):
         self.creds_cache = {}
         self.get_creds_lock = Lock()
 
-        self.config_path = self.configLocation / "yubiotp_config.toml"
-
         self.config = self.prepare_config()
+        self.notification = None
+
+    def configWidget(self):
+        return [
+            {
+                'type': "label",
+                'text': __doc__.strip(),
+            },
+            {
+                'type': "combobox",
+                'property': "multi_device_mode",
+                'label': "Multi Device Mode",
+                'items': [mode.value for mode in Mode],
+                'widget_properties': {'tooltip': 'How plugin should behave when multiple yubikeys are detected'}
+            },
+            {
+                'type': "label",
+                'text': "\n".join(
+                    f"{mode.value} — {mode.description}" for mode in Mode
+                ),
+            },
+        ]
 
     def get_unlocked_yk_session(self, connection, yk_settings):
         session = OathSession(connection)
@@ -117,7 +196,7 @@ class Plugin(PluginInstance, TriggerQueryHandler):
                 return None
         return session
 
-    def clip_action_factory(self, entry: Credential, code: t.Optional[Code], device_serial: int, type_in: bool = False):
+    def clip_action_factory(self, entry: Credential, code: Code | None, device_serial: int, type_in: bool = False):
         if type_in:
             clipboard_method = setClipboardTextAndPaste
         else:
@@ -128,56 +207,38 @@ class Plugin(PluginInstance, TriggerQueryHandler):
 
         def clip_action_touch():
             devs = list_all_devices()
+            self.notification = Notification(
+                title="Touch your yubikey",
+                text=f"You need to touch your yubikey to generate TOTP code for {entry.issuer} ({entry.name})",
+            )
             for dev, nfo in devs:
                 if nfo.serial == device_serial:
                     with dev.open_connection(SmartCardConnection) as conn:
-                        session = self.get_unlocked_yk_session(conn, yk_settings=YkSettings('oath'))
+                        session = self.get_unlocked_yk_session(conn, yk_settings=YkSettings('oath_keys'))
                         code = session.calculate_code(entry)
                     clipboard_method(code.value)
+                    break
+            self.notification = None
 
         if code:
             return clip_action_notouch
         else:
-            return clip_action_touch
+            return Thread(target=clip_action_touch).start
+
+    @staticmethod
+    def prepare_multi_device_mode(val: str) -> Mode:
+        return Mode(val or Mode.ALL.value)
+
+    @staticmethod
+    def prepare_preferred_devices(val: str) -> tuple[int]:
+        return ()
+        # return tuple(map(int, (self.readConfig("preferred_devices", str) or "").split(',')))
 
     def prepare_config(self):
-        if self.config_path.exists():
-            with self.config_path.open() as fd:
-                config = tomllib.load(fd)
-        else:
-            config = {}
-
         return Config(
-            fallback_mode=config.get('fallback_mode', Mode.ALL),
-            preferred_devices=config.get('preferred_devices', ()),
-            icons=IconsConfig(
-                default=config.get('icons', {}).get('default', ''),
-                mapping=[
-                    IconMatch(
-                        name=match['name'],
-                        match=re.compile(
-                            pattern=match['match'],
-                            flags=re_flags(match.get('match_flags', '')),
-                        ),
-                        icon=icon
-                    )
-                    for match in config.get('icons', {}).get('mapping', [])
-                    if (icon := Path(match['icon'].format(
-                        DATA=self.dataLocation,
-                    ))).exists()
-                ],
-            ),
+            fallback_mode=self.prepare_multi_device_mode(self.readConfig("multi_device_mode", str)),
+            preferred_devices=self.prepare_preferred_devices(self.readConfig("preferred_devices", str)),
         )
-
-    def match_icon(self, entry):
-        match_name = f'{entry.issuer} ({entry.name})'
-
-        for match in self.config.icons.mapping:
-            if match.match.search(match_name) is None:
-                continue
-            return str(match.icon)
-
-        return self.config.icons.default
 
     def order_devices(self, devices, order):
         def order_fn(device):
@@ -197,39 +258,44 @@ class Plugin(PluginInstance, TriggerQueryHandler):
         else:
             mode = self.config.fallback_mode
 
-        creds = []
+        creds = {}
         yk_settings = YkSettings('oath_keys')
 
-        for i, (device, dev_info) in enumerate(devices):
-            if i > 0 and mode == Mode.FIRST:
-                break
+        if mode == Mode.MERGE_ALL:
+            key = lambda entry: (entry[0].id, entry[1].value if entry[1] else None)
+        elif mode == Mode.MERGE_OPEN:
+            key = lambda entry: (entry[0].id, entry[1].value if entry[1] else entry[2])
+        else:
+            key = lambda entry: (entry[0].id, entry[1].value if entry[1] else None, entry[2])
+
+        for device, dev_info in devices:
             with device.open_connection(SmartCardConnection) as conn:
                 session = self.get_unlocked_yk_session(conn, yk_settings=yk_settings)
 
                 if session is None:
                     continue
 
-                creds += [
-                    (
-                        cred,
-                        None if cred.touch_required else session.calculate_code(cred),
-                        dev_info.serial
-                    ) for cred in session.calculate_all()
-                ]
-        if mode == Mode.MERGE_OPEN:
-            ...  # TODO: implement merging logic
-        if mode == Mode.MERGE_ALL:
-            ...  # TODO: implement merging logic
+                creds = {
+                    key(
+                        entry := (
+                            cred,
+                            code,
+                            dev_info.serial
+                        )
+                    ): entry for cred, code in session.calculate_all().items()
+                } | creds
+            if mode == Mode.FIRST:
+                break
 
         cache_for = min([
-            code.valid_to for _, code, _ in creds
+            code.valid_to for _, code, _ in creds.values()
             if code is not None
         ] + [float('inf')])
         cache_for = 30 if cache_for == float('inf') else cache_for
         self.creds_cache['expiration'] = cache_for
-        self.creds_cache['data'] = creds
+        self.creds_cache['data'] = creds.values()
 
-        return creds
+        return creds.values()
 
     def get_credentials(self, query):
         self.get_creds_lock.acquire()
@@ -244,16 +310,19 @@ class Plugin(PluginInstance, TriggerQueryHandler):
     def format_value(self, code):
         return code.value
 
-    def handleTriggerQuery(self, query: TriggerQuery):
+    def handleTriggerQuery(self, query: Query):
         stripped = query.string.strip()
+        icons = icon_finder()
         if stripped:
             for entry, code, device_serial in self.get_credentials(stripped):
                 query.add(
                     StandardItem(
                         id=f'otp-{entry.id.decode()}',
-                        # iconUrls=self.match_icon(entry),
+                        iconUrls=list(
+                            filter(None, [str(icons.get_icon(entry.issuer, entry.name))]),
+                        ),
                         text=self.format_value(code) if code else '*** ***',
-                        subtext=f'{entry.issuer} ({entry.name})',
+                        subtext=f'{entry.issuer} ({entry.name}) {entry.id}',
                         actions=[
                             Action(
                                 id=f'otp-{entry.id.decode()}-clip',
