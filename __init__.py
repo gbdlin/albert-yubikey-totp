@@ -22,11 +22,6 @@ try:
 except ImportError:
     pass
 
-try:
-    import tomllib
-except ImportError:
-    import toml as tomllib
-
 md_iid = "2.0"
 md_version = "0.4"
 md_name = "Yubikey OTP"
@@ -34,7 +29,7 @@ md_description = "Fetches specific HOTP/TOTP token from Yubikey OATH module"
 md_license = "BSD-2-Clause"
 md_url = "https://github.com/albertlauncher/python"
 md_maintainers = "@GwynBleidD"
-md_lib_dependencies = ["yubikey-manager", "toml"]
+md_lib_dependencies = ["yubikey-manager"]
 
 __triggers__ = "otp "
 
