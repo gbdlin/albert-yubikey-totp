@@ -103,7 +103,7 @@ class Mode(str, Enum):
         "merge by name and code",
         "use all entries, but try to merge identical ones by name and generated code (don't merge requiring touch)",
     )
-    MERGE_ALL = "merge by code", "use all entries, but try to merge identical ones by name (also merge requiring touch)"
+    MERGE_ALL = "merge by name", "use all entries, but try to merge identical ones by name (also merge requiring touch)"
 
     def __new__(cls, value, description):
         obj = str.__new__(cls, [value])
@@ -222,7 +222,10 @@ class Plugin(PluginInstance, TriggerQueryHandler):
 
     @staticmethod
     def prepare_multi_device_mode(val: str) -> Mode:
-        return Mode(val or Mode.ALL.value)
+        try:
+            return Mode(val or Mode.ALL.value)
+        except ValueError:
+            return Mode.ALL
 
     @staticmethod
     def prepare_preferred_devices(val: str) -> tuple[int]:
