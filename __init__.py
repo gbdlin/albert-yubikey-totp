@@ -60,7 +60,7 @@ class IconFinder(IconFinderProtocol):
         ]
 
     def get_icon(self, issuer: str, name: str) -> Path | None:
-        issuer_upper = issuer.upper()
+        issuer_upper = issuer.upper() if issuer else None
         name_upper = name.upper()
 
         def match_icon(el):
@@ -320,7 +320,7 @@ class Plugin(PluginInstance, TriggerQueryHandler):
                             filter(None, [str(icons.get_icon(entry.issuer, entry.name))]),
                         ),
                         text=self.format_value(code) if code else '*** ***',
-                        subtext=f'{entry.issuer} ({entry.name}) {entry.id}',
+                        subtext=f'{entry.issuer} ({entry.name}) {entry.id}' if entry.issuer else f"{entry.name} {entry.id}",
                         actions=[
                             Action(
                                 id=f'otp-{entry.id.decode()}-clip',
