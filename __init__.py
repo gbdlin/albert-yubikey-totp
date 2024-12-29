@@ -320,7 +320,7 @@ class Plugin(PluginInstance, TriggerQueryHandler):
                             filter(None, [str(icons.get_icon(entry.issuer, entry.name))]),
                         ),
                         text=self.format_value(code) if code else '*** ***',
-                        subtext=f'{entry.issuer} ({entry.name}) {entry.id}' if entry.issuer else f"{entry.name} {entry.id}",
+                        subtext=f'{entry.issuer} ({entry.name})' if entry.issuer else f"{entry.name}",
                         actions=[
                             Action(
                                 id=f'otp-{entry.id.decode()}-clip',
